@@ -1,0 +1,212 @@
+name: Go Build & Release
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+# bhaus-tree-sitter is a private repo, so `go mod download` needs GOPRIVATE
+# (skip the public proxy/sumdb, which can't see private modules) plus a
+# token-authenticated https rewrite (the runner has no SSH key). Both are
+# repeated in every job below rather than factored out, since env/steps
+# aren't shareable across jobs in Actions.
+env:
+  GOPRIVATE: github.com/sjsone/bhaus-tree-sitter
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bhaus-util
+    steps:
+      - name: Checkout bhaus-util
+        uses: actions/checkout@v4
+        with:
+          path: bhaus-util
+
+      - name: Configure private module access
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.BHAUS_TREE_SITTER_TOKEN || secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "bhaus-util/go.mod"
+
+      # The grammar binding is cgo (bindings/go/binding.go #includes
+      # src/parser.c), so a C compiler is required to build or test anything
+      # that imports the parser. ubuntu-latest ships gcc, this makes the
+      # dependency explicit.
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: gofmt
+        run: |
+          fmt_out="$(gofmt -l pkg cmd)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race -cover ./...
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: govulncheck
+        run: $(go env GOPATH)/bin/govulncheck ./...
+
+  # GoReleaser OSS cannot merge cgo binaries built on separate runners into
+  # one release (that needs GoReleaser Pro's split/merge, or its `prebuilt`
+  # builder). So this matrix does a plain `go build` per target instead, on
+  # whichever runner can actually produce it, and `release` below packages
+  # and publishes the results by hand. See .goreleaser.yaml for the
+  # single-machine equivalent (useful for local snapshot builds).
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: bhaus-util
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            cc: "zig cc -target x86_64-linux-gnu"
+            cxx: "zig c++ -target x86_64-linux-gnu"
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-latest
+            cc: "zig cc -target aarch64-linux-gnu"
+            cxx: "zig c++ -target aarch64-linux-gnu"
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-latest
+            cc: "zig cc -target x86_64-windows-gnu"
+            cxx: "zig c++ -target x86_64-windows-gnu"
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            runner: ubuntu-latest
+            cc: "zig cc -target aarch64-windows-gnu"
+            cxx: "zig c++ -target aarch64-windows-gnu"
+            archive: zip
+          - goos: darwin
+            goarch: amd64
+            runner: macos-latest
+            cc: "clang -arch x86_64"
+            cxx: "clang++ -arch x86_64"
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+            cc: "clang -arch arm64"
+            cxx: "clang++ -arch arm64"
+            archive: tar.gz
+    steps:
+      - name: Checkout bhaus-util
+        uses: actions/checkout@v4
+        with:
+          path: bhaus-util
+
+      - name: Configure private module access
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.BHAUS_TREE_SITTER_TOKEN || secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "bhaus-util/go.mod"
+
+      # zig is only needed on the ubuntu (linux/windows) legs — the darwin
+      # legs cross-arch build with the macos-latest runner's own clang,
+      # because zig's bundled macOS target is missing libresolv.
+      - name: Install zig
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          mkdir -p /tmp/zig
+          tar -xJf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
+          echo "/tmp/zig" >> "$GITHUB_PATH"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          ext=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then ext=".exe"; fi
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/sjsone/bhaus-util/pkg/version.Version=${GITHUB_REF_NAME} -X github.com/sjsone/bhaus-util/pkg/version.Commit=${GITHUB_SHA:0:7}" \
+            -o "dist/bhaus-util${ext}" ./cmd/bhaus-util
+
+      - name: Package
+        run: |
+          cd dist
+          name="bhaus-util_${GITHUB_REF_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip "${name}.zip" bhaus-util.exe
+            shasum -a 256 "${name}.zip" > "${name}.zip.sha256"
+          else
+            tar -czf "${name}.tar.gz" bhaus-util
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          fi
+          rm -f bhaus-util bhaus-util.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bhaus-util_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: bhaus-util/dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: cat dist/*.sha256 > dist/checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

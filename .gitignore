@@ -1,0 +1,15 @@
+
+bin/
+
+node_modules
+
+docs/superpowers
+
+# Misc
+.docs
+.DS_Store
+CLAUDE.md
+*.wasm
+
+go.work
+go.work.sum

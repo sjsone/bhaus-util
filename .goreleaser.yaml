@@ -1,0 +1,97 @@
+version: 2
+
+project_name: bhaus-util
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: bhaus-util
+    main: ./cmd/bhaus-util
+    binary: bhaus-util
+
+    # The -X paths embed the module path and must track it exactly. A stale path
+    # is not an error: the linker silently writes nothing and every release
+    # reports version "dev". Verify after any module rename with
+    #   go build -ldflags "-X <path>/pkg/version.Version=x" -o /tmp/b ./cmd/bhaus-util \
+    #     && /tmp/b version
+    ldflags:
+      - -s -w
+      - -X github.com/sjsone/bhaus-util/pkg/version.Version={{ .Version }}
+      - -X github.com/sjsone/bhaus-util/pkg/version.Commit={{ .ShortCommit }}
+
+    # The tree-sitter grammar is a cgo package (bindings/go/binding.go
+    # #includes src/parser.c), so every target needs a real C toolchain.
+    # `zig cc`/`zig c++` cross-compile linux and windows cleanly from any
+    # host. zig's bundled macOS target is missing libresolv, so darwin
+    # targets use the host's own clang instead — this build config is
+    # therefore only verified end-to-end when run *on a Mac* with zig
+    # installed (`brew install zig`). CI does not use this file to build
+    # release binaries; see build_and_release.yaml's `build` job, which
+    # runs a plain `go build` matrix across ubuntu-latest (zig) and
+    # macos-latest (native clang) instead, because GoReleaser OSS cannot
+    # merge artifacts built on separate runners into one release — only
+    # GoReleaser Pro's split/merge and `prebuilt` builder can do that.
+    #
+    # Useful locally for a single-machine snapshot build:
+    #   goreleaser release --snapshot --clean --skip=publish
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    overrides:
+      - goos: linux
+        goarch: amd64
+        env:
+          - CC=zig cc -target x86_64-linux-gnu
+          - CXX=zig c++ -target x86_64-linux-gnu
+      - goos: linux
+        goarch: arm64
+        env:
+          - CC=zig cc -target aarch64-linux-gnu
+          - CXX=zig c++ -target aarch64-linux-gnu
+      - goos: windows
+        goarch: amd64
+        env:
+          - CC=zig cc -target x86_64-windows-gnu
+          - CXX=zig c++ -target x86_64-windows-gnu
+      - goos: windows
+        goarch: arm64
+        env:
+          - CC=zig cc -target aarch64-windows-gnu
+          - CXX=zig c++ -target aarch64-windows-gnu
+      - goos: darwin
+        goarch: amd64
+        env:
+          - CC=clang -arch x86_64
+          - CXX=clang++ -arch x86_64
+      - goos: darwin
+        goarch: arm64
+        env:
+          - CC=clang -arch arm64
+          - CXX=clang++ -arch arm64
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
